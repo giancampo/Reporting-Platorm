@@ -1,5 +1,5 @@
-/** Shapes shared across the frontend. Mirrors, on the R2-document side, the
- * `Document` dataclass in etl/src/reporting_etl/storage/r2_writer.py, and on
+/** Shapes shared across the frontend. Mirrors, on the storage-document side,
+ * the `Document` dataclass in etl/src/reporting_etl/storage/base.py, and on
  * the config side, the tables in supabase/migrations/0001_config_tables.sql.
  * Keep both in sync by hand — there is no code generation step yet (a
  * follow-up would generate this from the SQL/Python, not duplicate by hand

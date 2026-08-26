@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "etl" / "src"))
 from reporting_etl.config_client import ConfigClient  # noqa: E402
 from reporting_etl.connectors import CONNECTOR_REGISTRY  # noqa: E402
 from reporting_etl.retention.purge import cutoff_year  # noqa: E402
-from reporting_etl.storage.r2_writer import R2Client  # noqa: E402
+from reporting_etl.storage.gcs_adapter import GCSAdapter  # noqa: E402
 
 
 def month_windows(start: date, end: date):
@@ -42,7 +42,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = ConfigClient.from_env()
-    r2 = R2Client.from_env()
+    storage = GCSAdapter.from_env()
     project = config.get_project_by_slug(args.project_slug)
 
     today = date.today()
@@ -63,10 +63,11 @@ def main() -> None:
                 print(f"Backfilling {connection.source}/{query_def.report_key} {window_start}..{window_end}")
                 result = connector.extract(query_def, window_start, window_end)
                 print(f"  -> {len(result.rows)} rows")
-                # Writing to R2 mirrors main.py's per-period document shape;
-                # kept as a thin call here rather than importing main.py's
-                # orchestration to keep the rate-limiting loop explicit and
-                # easy to reason about during a long-running backfill.
+                # Writing via `storage` mirrors main.py's per-period document
+                # shape; kept as a thin call here rather than importing
+                # main.py's orchestration to keep the rate-limiting loop
+                # explicit and easy to reason about during a long-running
+                # backfill.
                 time.sleep(min_interval_seconds)
 
 

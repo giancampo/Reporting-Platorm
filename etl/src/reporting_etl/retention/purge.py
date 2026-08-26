@@ -12,9 +12,9 @@ period always needs 24 full months upstream of the oldest month shown.
 `retention_calendar_years` is a per-project parameter (`projects` table),
 default 2 — never a constant here.
 
-Deletion is decided on the PERIOD encoded in the R2 key, never on object
-age (§15 anti-pattern): files are rewritten every night, so an object's
-last-modified timestamp bears no relation to which period it holds.
+Deletion is decided on the PERIOD encoded in the object key, never on
+object age (§15 anti-pattern): objects are rewritten every night, so an
+object's last-modified timestamp bears no relation to which period it holds.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-from ..storage.r2_writer import parse_r2_key, period_year
+from ..storage.base import StorageAdapter, parse_object_key, period_year
 
 
 @dataclass(frozen=True)
@@ -42,29 +42,31 @@ def cutoff_year(today: date, retention_calendar_years: int) -> int:
 
 
 def select_keys_to_purge(all_keys: list[str], today: date, retention_calendar_years: int) -> list[str]:
-    """`all_keys` are the full list of R2 object keys for one project
-    (already prefix-filtered by the caller to `{project_slug}/`)."""
+    """`all_keys` are the full list of object keys for one project (already
+    prefix-filtered by the caller to `{project_slug}/`)."""
     floor_year = cutoff_year(today, retention_calendar_years)
     to_purge: list[str] = []
     for key in all_keys:
-        parsed = parse_r2_key(key)
+        parsed = parse_object_key(key)
         if period_year(parsed["period"]) < floor_year:
             to_purge.append(key)
     return to_purge
 
 
 def run_purge(
-    r2_client,
+    storage_client: StorageAdapter,
     project: PurgeProjectConfig,
     today: date,
 ) -> list[str]:
     """Returns the list of keys deleted. Archival-before-delete (the
     opt-in monthly summary rollup from §6) is a separate concern handled by
     the caller before invoking this function, since it needs access to the
-    document contents, not just keys."""
+    document contents, not just keys. Provider-agnostic: works against
+    whatever `StorageAdapter` implementation is passed in (base.py) —
+    currently GCSAdapter, storage/gcs_adapter.py."""
     prefix = f"{project.project_slug}/"
-    all_keys = r2_client.list_keys_with_prefix(prefix)
+    all_keys = storage_client.list_keys_with_prefix(prefix)
     keys_to_purge = select_keys_to_purge(all_keys, today, project.retention_calendar_years)
     if keys_to_purge:
-        r2_client.delete_keys(keys_to_purge)
+        storage_client.delete_keys(keys_to_purge)
     return keys_to_purge

@@ -19,7 +19,7 @@ $$ language plpgsql;
 -- ---------------------------------------------------------------------------
 create table projects (
   id                       uuid primary key default gen_random_uuid(),
-  slug                     text not null unique,                 -- used as the R2 key prefix
+  slug                     text not null unique,                 -- used as the GCS object key prefix
   display_name             text not null,
   report_language          text not null default 'en',           -- drives comment/PDF language, §5
   timezone                 text not null,                        -- GA4 property timezone, §7

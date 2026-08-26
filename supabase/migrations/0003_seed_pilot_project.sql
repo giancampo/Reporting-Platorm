@@ -1,5 +1,5 @@
 -- Phase 0 pilot project, wired to the dummy connector so the full pipeline
--- (config -> ETL -> R2 -> frontend) can be exercised before any real GA4
+-- (config -> ETL -> GCS -> frontend) can be exercised before any real GA4
 -- credentials exist. See etl/src/reporting_etl/connectors/dummy.py.
 
 insert into projects (

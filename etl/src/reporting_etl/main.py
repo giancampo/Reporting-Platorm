@@ -13,8 +13,14 @@ Per-project sequence:
 3. Apply exclusion rules (non-destructive), cardinality bucketing for
    high-cardinality query_defs, and reconcile against the dimensionless
    total.
-4. Write one R2 document per (source, report_key, granularity, period).
+4. Write one storage object per (source, report_key, granularity, period).
 5. Record the outcome in etl_runs and run the alerting checks.
+
+Also pings Supabase once at the very start of the run (action-plan.md §3
+"Keep-alive requirement": free Supabase projects pause after 7 days of
+inactivity, so a lightweight explicit touch — independent of whether any
+project's extraction succeeds — is mandatory, not just a side effect of the
+config reads below).
 """
 
 from __future__ import annotations
@@ -26,7 +32,8 @@ from .alerting import AlertSink, RunOutcome, check_run_outcome, check_volume_ano
 from .config_client import ConfigClient, ProjectConfig
 from .connectors import CONNECTOR_REGISTRY
 from .connectors.base import ExtractedRow
-from .storage.r2_writer import Document, R2Client, build_r2_key
+from .storage.base import Document, build_object_key
+from .storage.gcs_adapter import GCSAdapter
 from .transform.cardinality import bucket_top_n
 from .transform.exclusion_rules import apply_exclusion_rules
 from .transform.totals import compute_unattributed
@@ -50,7 +57,7 @@ def _period_key(day: date, granularity: str) -> str:
 
 def run_for_project(
     config: ConfigClient,
-    r2: R2Client,
+    storage: GCSAdapter,
     alert_sink: AlertSink,
     project: ProjectConfig,
     today: date,
@@ -98,8 +105,8 @@ def run_for_project(
                     unattributed=unattributed,
                     excluded_row_count=len(excluded_rows),
                 )
-                key = build_r2_key(project.slug, connection.source, query_def.report_key, query_def.granularity, period)
-                r2.put_document(key, document)
+                key = build_object_key(project.slug, connection.source, query_def.report_key, query_def.granularity, period)
+                storage.put_document(key, document)
 
                 outcome = RunOutcome(
                     project_slug=project.slug,
@@ -131,19 +138,21 @@ def run_for_project(
 def run_all_projects() -> None:
     logging.basicConfig(level=logging.INFO)
     config = ConfigClient.from_env()
-    r2 = R2Client.from_env()
+    config.ping()  # keep-alive: must happen regardless of what follows
+    storage = GCSAdapter.from_env()
     alert_sink = _load_alert_sink()
     today = date.today()
 
     for project in config.list_active_projects():
-        run_for_project(config, r2, alert_sink, project, today)
+        run_for_project(config, storage, alert_sink, project, today)
 
 
 def _load_alert_sink() -> AlertSink:
-    # Deferred import: the webhook sink pulls in httpx only when actually needed.
-    from .alerting_sinks import WebhookAlertSink
+    # Deferred import: keeps this importable without google-cloud-logging
+    # installed, for tests that never call it.
+    from .alerting_sinks import CloudMonitoringAlertSink
 
-    return WebhookAlertSink.from_env()
+    return CloudMonitoringAlertSink.from_env()
 
 
 if __name__ == "__main__":

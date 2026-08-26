@@ -5,27 +5,32 @@ Studio dashboards. Full rationale and every locked-in decision live in
 [`action-plan.md`](action-plan.md); this document is the operational
 reference. Target domain: `reporting.example.com` (replace with your own).
 
+**Binding constraint**: no payment method exists for any provider other
+than the already-billed Google Cloud account (action-plan.md §2.1). Every
+component in this stack was chosen or rejected on that basis — see §3
+"Payment method audit" in the plan before adding anything new.
+
 ## 1. Architecture
 
 ```
-┌─────────────┐   nightly cron    ┌──────────────────┐    gzip JSON     ┌─────────────┐
-│ GA4 Data API │ ────────────────▶│  Cloud Run Job     │ ───────────────▶│ Cloudflare  │
-│ (+ Admin API)│                   │  (etl/, Python,    │                  │ R2 (`eu`    │
-└─────────────┘                   │  europe-west1)     │                  │ jurisdiction)│
-                                   └─────────┬──────────┘                  └──────┬──────┘
-                                             │ writes config/results               │ GET, JWT-gated
-                                             ▼                                     ▼
-                                   ┌──────────────────┐   REST + RLS    ┌─────────────────────┐
-                                   │ Supabase Postgres  │◀───────────────│ Cloudflare Worker     │
-                                   │ (eu-central-1)     │  auth + config  │ (worker/) — the only  │
-                                   │ config + auth + RLS │────────────────▶│ path that reads R2    │
-                                   └──────────┬──────────┘                └──────────┬───────────┘
-                                              │ auth (Supabase JS)                    │ fetch
-                                              ▼                                       ▼
+┌─────────────┐   nightly cron    ┌──────────────────┐   gzip JSON      ┌──────────────┐
+│ GA4 Data API │ ────────────────▶│  Cloud Run JOB     │ ────────────────▶│ Google Cloud │
+│ (+ Admin API)│                   │  (etl/, Python,    │                  │ Storage       │
+└─────────────┘                   │  europe-west1)     │                  │ (europe-west1,│
+                                   └─────────┬──────────┘                  │ private)      │
+                                             │ writes config/results        └──────┬───────┘
+                                             ▼                                     │ signed URL only
+                                   ┌──────────────────┐   REST + RLS    ┌──────────▼───────────┐
+                                   │ Supabase Postgres  │◀───────────────│ Cloud Run SERVICE      │
+                                   │ (eu-central-1)     │  auth + config  │ (signing-service/) —   │
+                                   │ config + auth + RLS │────────────────▶│ the only path that     │
+                                   └──────────┬──────────┘                │ reaches a GCS object   │
+                                              │ auth (Supabase JS)        └──────────┬─────────────┘
+                                              ▼                                      │ {url}, then a direct fetch
                                    ┌──────────────────────────────────────────────────────┐
                                    │  React + Vite + TS + ECharts frontend (frontend/)      │
                                    │  — filtering/aggregation/derived metrics run HERE      │
-                                   │  Hosted on Cloudflare Pages                            │
+                                   │  Hosted on Cloudflare Pages (static assets only)       │
                                    └──────────────────────────────────────────────────────┘
 ```
 
@@ -34,70 +39,104 @@ Repository layout:
 | Path | Role |
 |---|---|
 | `supabase/migrations/` | Control-plane schema (config tables) + RLS policies |
-| `etl/` | Cloud Run Job: GA4 extraction, transforms, R2 writer, retention purge, alerting, reconciliation |
-| `worker/` | Cloudflare Worker: the only path that reads reporting data out of R2 |
+| `etl/` | Cloud Run Job: GA4 extraction, transforms, storage adapter, retention purge, alerting, reconciliation |
+| `signing-service/` | Cloud Run service: the only path that issues access to a GCS object |
 | `frontend/` | React app: report pages, admin panel, aggregation/derived-metric engines, i18n |
 | `comment-engine/` | Deterministic (no-LLM) automated comment generation, shared by the ETL/an Edge Function |
 | `scripts/` | Operational CLIs: backfill, reconciliation |
 
 **Data plane vs control plane** (action-plan.md §6): reporting data itself
-never touches Postgres — it lives on R2 as gzipped JSON, one file per
-project/source/report/period, rewritten nightly. Supabase holds only
-configuration, auth, and analyst-authored content (comments). The frontend
-downloads one file per report block and does all filtering, dimension
-toggling and metric aggregation **locally in the browser** — no query
-latency, no marginal cost per view.
+never touches Postgres — it lives in Google Cloud Storage as gzipped JSON,
+one object per project/source/report/period, rewritten nightly. Supabase
+holds only configuration, auth, and analyst-authored content (comments).
+The frontend asks the signing service for a short-lived signed URL, fetches
+the object directly from GCS, and does all filtering, dimension toggling
+and metric aggregation **locally in the browser** — no query latency, no
+marginal cost beyond the bytes transferred.
 
 **Load-bearing principle** (action-plan.md §4): nothing about *what* is
 extracted, *what* a report page shows, or *what* triggers a comment is
-hardcoded. It all lives in the config tables listed in §4 below.
+hardcoded. It all lives in the config tables listed in §4 below. Storage
+itself is also behind an adapter (`etl/src/reporting_etl/storage/base.py`)
+— swapping the backend is a one-file change, not an architecture change.
 
 ## 2. Setup from scratch
 
 ⚠️ Settings marked **IRREVERSIBLE** cannot be changed after creation — the
-resource must be deleted and recreated, which for R2/Supabase/BigQuery means
-a full data migration. Get these right the first time.
+resource must be deleted and recreated, which for GCS/Supabase/BigQuery
+means a full data migration. Get these right the first time.
 
-1. **GCP project** — create a project, enable the Google Analytics Data API,
-   Google Analytics Admin API, Cloud Run, Cloud Scheduler, Secret Manager.
-   Attach a billing account and **configure budget alerts immediately**
-   (action-plan.md §3: GCP's free tier has no hard spending cap).
-2. **Service account** — create one in the GCP project, generate a JSON key,
-   store it in **Secret Manager with EU-region replication (IRREVERSIBLE)**.
-   Do not commit the key file; `etl/.gitignore` already excludes
-   `service-account*.json`.
-3. **Cloudflare R2 bucket** — create with **jurisdiction `eu`
-   (IRREVERSIBLE)**, not a location hint (`weur`/`eeur` are best-effort
-   only, not a residency guarantee — action-plan.md §3). Jurisdiction-bound
-   buckets must be managed via the API; some dashboard tooling doesn't
-   support them. Access endpoint:
-   `https://{account_id}.eu.r2.cloudflarestorage.com`.
+1. **GCP project** — create a project (or use the existing one — this stack
+   is designed to add zero new vendors), enable the Google Analytics Data
+   API, Google Analytics Admin API, Cloud Run, Cloud Build, Artifact
+   Registry, Cloud Scheduler, Secret Manager, Cloud Monitoring. Attach a
+   billing account and **configure budget alerts immediately**
+   (action-plan.md §3: GCP's free tier has no hard spending cap, and GCS
+   egress specifically has no hard cap at all — see §9 below).
+2. **Service account** (for GA4 extraction) — create one in the GCP
+   project, generate a JSON key, store it in **Secret Manager with
+   EU-region replication (IRREVERSIBLE)**. Do not commit the key file;
+   `etl/.gitignore` already excludes `service-account*.json`.
+3. **GCS bucket** — create in **`europe-west1` (Belgium, IRREVERSIBLE)**,
+   a single region (not multi-region — costs more, buys redundancy this
+   workload doesn't need). **Private, with uniform bucket-level access
+   enabled and no `allUsers`/`allAuthenticatedUsers` grant, ever** — the
+   only read path is a signed URL issued by `signing-service/`.
 4. **Supabase project** — create in **region `eu-central-1` (Frankfurt,
    IRREVERSIBLE)**. Run the migrations in `supabase/migrations/` in order
    (`supabase db push`, or apply the four `.sql` files manually via the SQL
    editor). Set `enable_signup = false` (already the default in
    `supabase/config.toml`) — users are invited by an admin, never
    self-registered.
-5. **Cloud Run Job** — deploy `etl/` to **region `europe-west1`** (the one
-   setting here that *is* changeable later, by redeploying):
+5. **Custom SMTP for Supabase Auth** — the built-in email sender only
+   reaches the project's own team and is capped at ~2 messages/hour (not
+   production-usable). In the Supabase dashboard, configure custom SMTP
+   using your existing Google Workspace account's SMTP relay — no new
+   vendor, no card. Do this now, in Phase 2, not when the first client
+   can't log in.
+6. **Cloud Run JOB** — deploy `etl/` to **region `europe-west1`** (the one
+   setting here that *is* changeable later, by redeploying), same region as
+   the bucket so ETL reads/writes never generate egress charges:
    ```bash
    cd etl
    gcloud run jobs deploy reporting-etl \
      --source . \
      --region europe-west1 \
      --set-secrets GOOGLE_APPLICATION_CREDENTIALS=ga4-service-account:latest \
-     --set-env-vars SUPABASE_URL=...,R2_ENDPOINT_URL=...,R2_BUCKET=...
+     --set-env-vars SUPABASE_URL=...,SUPABASE_SERVICE_ROLE_KEY=...,GCS_BUCKET=...,GCP_PROJECT_ID=...
    ```
-6. **Cloud Scheduler** — create a job that triggers the Cloud Run Job
+7. **Cloud Scheduler** — create a job that triggers the Cloud Run Job
    nightly (e.g. `0 3 * * *` in the project's primary timezone).
-7. **Cloudflare Worker** — `cd worker && wrangler secret put SUPABASE_JWT_SECRET`
-   (found in the Supabase project's API settings), `wrangler secret put
-   SUPABASE_ANON_KEY`, then `npm run deploy`.
-8. **Cloudflare Pages** — connect the `frontend/` directory, build command
-   `npm run build`, output directory `dist`. Set `VITE_SUPABASE_URL`,
-   `VITE_SUPABASE_ANON_KEY`, `VITE_WORKER_URL` as Pages environment
-   variables (copy from `frontend/.env.example`).
-9. **Custom domain** — point your domain (e.g. `reporting.example.com`) at the Pages project.
+8. **Cloud Run SERVICE** (signing service) — deploy `signing-service/` to
+   **region `europe-west1`**, same reasoning as the job:
+   ```bash
+   cd signing-service
+   gcloud run deploy signing-service \
+     --source . \
+     --region europe-west1 \
+     --set-env-vars SUPABASE_URL=...,SUPABASE_ANON_KEY=...,SUPABASE_JWT_SECRET=...,GCS_BUCKET=...
+   ```
+   Then grant the service's own runtime identity the `roles/iam.serviceAccountTokenCreator`
+   role **on itself** — this is what lets it sign GCS URLs via IAM signBlob
+   without a downloadable private key file:
+   ```bash
+   gcloud iam service-accounts add-iam-policy-binding <signing-service-sa-email> \
+     --member="serviceAccount:<signing-service-sa-email>" \
+     --role="roles/iam.serviceAccountTokenCreator"
+   ```
+9. **Cloud Monitoring alerting** — create a log-based metric filtering on
+   `labels.reporting_etl_alert="true"` (see
+   `etl/src/reporting_etl/alerting_sinks.py`), a notification channel
+   (email), and an alerting policy tying the two together. Console or
+   `gcloud alpha monitoring` — inside the existing GCP project, no third-party
+   service.
+10. **Cloudflare Pages** — connect the `frontend/` directory, build command
+    `npm run build`, output directory `dist`. Set `VITE_SUPABASE_URL`,
+    `VITE_SUPABASE_ANON_KEY`, `VITE_SIGNING_SERVICE_URL` as Pages
+    environment variables (copy from `frontend/.env.example`). Cloudflare
+    hosts static assets only here — no reporting data ever transits it.
+11. **Custom domain** — point your domain (e.g. `reporting.example.com`) at
+    the Pages project.
 
 ## 3. Onboarding a new project
 
@@ -118,17 +157,17 @@ a full data migration. Get these right the first time.
    product/landing-page breakdowns).
 6. Insert `report_defs` rows for the pages the client should see.
 7. Assign users: invite the person via Supabase Auth (dashboard "Invite
-   user" or `supabase.auth.admin.inviteUserByEmail`) — a trigger
-   (`on_auth_user_created` in `0001_config_tables.sql`) automatically mirrors
-   the new `auth.users` row into `public.users`, then insert a
-   `project_users` row with the appropriate role (`admin` / `analyst` /
-   `client`).
+   user" or `supabase.auth.admin.inviteUserByEmail`, delivered through the
+   custom SMTP configured in §2.5) — a trigger (`on_auth_user_created` in
+   `0001_config_tables.sql`) automatically mirrors the new `auth.users` row
+   into `public.users`, then insert a `project_users` row with the
+   appropriate role (`admin` / `analyst` / `client`).
 8. Run the manual backfill (bounded to the retention window, rate-limited):
    ```bash
    python scripts/backfill.py --project-slug <slug> --requests-per-minute 30
    ```
 9. Run the reconciliation check against a manual GA4 UI read before treating
-   the project as live (see §12 below).
+   the project as live (see §7 below).
 
 **No code change and no deploy is required for any of the above** — that is
 the customisability principle in practice.
@@ -154,8 +193,10 @@ changing a row, never a file.
 | `legal_texts` | EN/IT legal copy shown in-app and in the PDF footer | Update the data-residency disclaimer wording without a deploy |
 
 RLS policies (`0002_rls_policies.sql`) are the single source of truth for
-"who can see what" — the Worker re-checks against the same policies rather
-than re-implementing role logic (see `worker/src/index.ts`).
+"who can see what" — the signing service re-checks against the same
+policies (via a request made with the caller's own JWT, so RLS decides)
+rather than re-implementing role logic; see
+`signing-service/src/signing_service/access_control.py`.
 
 ## 5. Derived metrics and exclusion rules
 
@@ -187,7 +228,7 @@ boolean grammar (`==`, `!=`, comparisons, `and`/`or`/`not`) over canonical
 dimension/metric names, evaluated by
 `etl/src/reporting_etl/transform/exclusion_rules.py`. Deliberately not
 `eval`/arbitrary code — this is analyst-authored config. Excluded rows are
-written to a separate file, never deleted.
+written to a separate object, never deleted.
 
 ## 6. Metric dictionary
 
@@ -216,7 +257,7 @@ admin panel), then re-invoke the Cloud Run Job for that project:
 ```bash
 gcloud run jobs execute reporting-etl --region europe-west1 --args="--project-slug=<slug>"
 ```
-Because R2 writes are full-object overwrites, re-running is always safe —
+Because GCS writes are full-object overwrites, re-running is always safe —
 there is no partial-write state to clean up.
 
 **Run a backfill**: `python scripts/backfill.py --project-slug <slug>
@@ -226,11 +267,17 @@ rate-limited, and separate from the nightly cron on purpose.
 **Read the logs**: Cloud Run Job execution logs are in Cloud Logging
 (`europe-west1`); per-run outcome summaries (rows extracted, duration,
 errors, reporting-identity switch outcome) are in the `etl_runs` table,
-surfaced in the admin panel.
+surfaced in the admin panel. Alerts written by
+`alerting_sinks.CloudMonitoringAlertSink` also land in Cloud Logging with
+`labels.reporting_etl_alert = "true"`.
 
 **Reconciliation**: `python scripts/reconcile.py --check
 sessions:<extracted>:<manual_ga4_ui_value>` — run against the pilot project
 in Phase 1 and after every `query_defs` change (action-plan.md §13).
+
+**Check the monthly bill**: GCS egress and storage are the only lines with
+real (if small) cost — see §9 below. Check the Billing console monthly; the
+budget alert from setup step 2.1 is the backstop, not a substitute.
 
 ## 8. Retention
 
@@ -241,9 +288,9 @@ in Phase 1 and after every `query_defs` change (action-plan.md §13).
 - **Purge date**: once a year, **1 February** (not 1 January) — the month
   of slack ensures the December report, delivered in January, still has a
   complete comparison at purge time.
-- **What's deleted**: R2 objects whose *data period* (from the key, not the
-  object's write timestamp — files are rewritten nightly) falls before
-  `current_year - retention_calendar_years`. See
+- **What's deleted**: GCS objects whose *data period* (from the key, not
+  the object's write timestamp — objects are rewritten nightly) falls
+  before `current_year - retention_calendar_years`. See
   `etl/src/reporting_etl/retention/purge.py`.
 - **What's never deleted**: comments, configuration, ETL run history, users.
   Small, and — for comments — analyst work product, not regenerable data.
@@ -252,19 +299,53 @@ in Phase 1 and after every `query_defs` change (action-plan.md §13).
   indefinitely, for answering a multi-year trend question without full
   daily detail.
 
-## 9. Data residency and provider jurisdiction
+## 9. Cost model
+
+The only billable component in this stack is Google Cloud (action-plan.md
+§2.2: "expected under $1/month at 60 projects"). Everything else — Supabase,
+Cloudflare Pages, Workspace SMTP — sits on a genuinely free, card-free tier.
+
+| Item | Estimate at 60 projects |
+|---|---|
+| GCS storage (4.5 GB steady state, EU regional) | ~$0.10/month |
+| GCS internet egress (1–2 GB/month, $0.12/GB first TB) | ~$0.12–0.25/month |
+| GCS operations | negligible |
+| Cloud Run job + signing service | $0 (within the permanent free tier) |
+| Cloud Build + Artifact Registry | ~$0 (2,500 free build-minutes/month; first 0.5 GB image storage free) |
+| Supabase, Cloudflare Pages, Workspace SMTP | $0 |
+
+Bucket and both Cloud Run components share `europe-west1`, so **ETL reads
+and writes generate no egress charge**: only what browsers download (via
+signed URLs) is billed. The Cloud Storage always-free 100 GB/month egress
+allowance applies to US regions only — unavailable here, don't count on it.
+
+**Controls in place** (mandatory, not advisory — GCS egress has no hard
+cap, only budget *alerts*):
+- The bucket is private, uniform bucket-level access, no public objects.
+- Signed URLs are short-lived (5 minutes, `signing-service/src/signing_service/main.py`'s
+  `SIGNED_URL_TTL_SECONDS`).
+- Budget alerts on the billing account (setup step 2.1).
+- If BigQuery is ever used (override layer, event-level export): custom
+  quotas at project level plus `maximum_bytes_billed` on every query, and
+  every query filtered on its partition column.
+
+The realistic failure mode is not gradual growth: it's a public object
+found by a crawler, or a runaway ETL loop. Both are addressed by the two
+bolded controls above.
+
+## 10. Data residency and provider jurisdiction
 
 > **Data residency and provider jurisdiction**
 >
 > All data handled by this tool is stored exclusively within the European Union:
-> - reporting data on Cloudflare R2, bucket created with the `eu` jurisdiction (pinned to EU member-state data centres, no replication to North America);
+> - reporting data in Google Cloud Storage, bucket located in `europe-west1` (Belgium), private, accessible only through short-lived signed URLs;
 > - users, configuration and comments on Supabase, region `eu-central-1` (Frankfurt);
-> - ETL processing on Google Cloud Run, region `europe-west1`;
+> - ETL processing and access control on Google Cloud Run, region `europe-west1`;
 > - credentials in Google Secret Manager with EU-region replication.
 >
 > Stored reporting data consists of **statistical aggregates** (sessions by channel, revenue by country, products by category) and contains no individual identifiers, client IDs, user IDs or user-level events. The only personal data processed by the tool are the email addresses of authorised users.
 >
-> **Known limitation.** The infrastructure providers used — Cloudflare, Inc. and Google LLC — are US-incorporated companies and therefore subject to the CLOUD Act, even when data physically resides in the European Union. The tool therefore satisfies a **data residency** requirement, but not a contractual requirement for processing by a processor established exclusively within the EU. Should a client impose that constraint, the storage and compute components must be migrated to European providers (for example Scaleway, OVHcloud, Hetzner, Exoscale), with an impact on operating costs.
+> **Known limitation.** The infrastructure providers used — Google LLC and Cloudflare, Inc. for static frontend hosting — are US-incorporated companies and therefore subject to the CLOUD Act, even when data physically resides in the European Union. The tool therefore satisfies a **data residency** requirement, but not a contractual requirement for processing by a processor established exclusively within the EU. Should a client impose that constraint, the storage and compute components must be migrated to European providers (for example Scaleway, OVHcloud, Hetzner, Exoscale), with an impact on operating costs.
 >
 > **Obligations of the tool operator**: execute DPAs with the providers, maintain an up-to-date sub-processor list, verify the legal bases for processing.
 >
@@ -275,19 +356,21 @@ The same text (EN + IT) is served in-app from the `legal_texts` config table
 (`frontend/src/pages/DataPrivacyPage.tsx`) and, condensed to one line, in
 the PDF footer — so updating the wording never requires a deploy.
 
-## 10. Known limits
+## 11. Known limits
 
 | Limit | Threshold | Consequence |
 |---|---|---|
+| No payment method beyond GCP | Binding constraint (action-plan.md §2.1) | Any provider requiring a card, however generous its free tier, is out — see §3 "Payment method audit" in the plan before adding a dependency |
 | GA4 Data API quota | 200,000 tokens/day, 40,000/hour, 10 concurrent requests per property | Never queried from the frontend; nightly pre-aggregated extraction stays well under this |
-| Cloud Run free tier | 180,000 vCPU-seconds / 360,000 GiB-seconds per month (~50 CPU hours) | First limit to saturate, around 150–200 projects; past that, cost is marginal ($0.000024/vCPU-second) |
-| R2 free tier | 10 GB storage, 1M writes/month | Not expected to saturate before Cloud Run does, at retention-window steady state |
-| Supabase free tier | 500 MB DB, 50k MAU | Config-only data; expected 10–20 MB at 60 projects |
+| Cloud Run free tier | 180,000 vCPU-seconds / 360,000 GiB-seconds per month (~50 CPU hours), shared across the job and the signing service | First limit to saturate, around 150–200 projects; past that, cost is marginal ($0.000024/vCPU-second) |
+| GCS egress | No hard cap — budgets are alerts, not blocks | Procedural control only: private bucket + short-lived signed URLs (§9) |
+| Supabase free tier | 500 MB DB, 50k MAU, **project pauses after 7 days of inactivity** | Config-only data, expected 10–20 MB at 60 projects; `ConfigClient.ping()` runs at the top of every nightly ETL invocation as an explicit keep-alive |
+| Signed URL TTL | 5 minutes | A page open longer than that re-requests on the next data refresh, not a one-time load; not an issue in practice since the frontend re-fetches per period change |
 | GA4 → BigQuery export (if adopted) | 1M events/day for standard properties, batch export paused with no recovery if consistently exceeded | Not viable for high-volume clients; not in the current stack |
 | GA4 Admin API (reporting identity) | **v1alpha** — can change without notice | `identity_switch.py` has an explicit fallback: on switch failure, extraction proceeds with the resting identity and the day is flagged partial, never a fabricated comparison |
 | GCP billing | No hard spending cap on the free tier | Budget alerts are mandatory (see §2); every BigQuery query must filter on its partition column |
 
 ---
 
-For every decision's full reasoning — including rejected alternatives — see
-[`action-plan.md`](action-plan.md).
+For every decision's full reasoning — including rejected alternatives and
+the payment-method audit — see [`action-plan.md`](action-plan.md).

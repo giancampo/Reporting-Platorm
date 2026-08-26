@@ -1,26 +1,30 @@
-"""R2 writer (action-plan.md §6).
+"""Storage adapter interface (action-plan.md §4: "Storage is behind an
+adapter. The rest of the system asks for 'the object for project X, report
+Y, period Z' and does not know whether it comes from GCS, R2 or anything
+else. This is what makes a future move back to R2 a one-file change.")
+
+Everything provider-agnostic lives here: the object key layout, the
+document schema, and the `StorageAdapter` Protocol every concrete backend
+implements. The current concrete backend is `storage/gcs_adapter.py`
+(Google Cloud Storage — R2 was rejected in the revised plan because it
+requires a payment method the analyst doesn't have, action-plan.md §3
+"Explicitly rejected options").
 
 Key format: `{project_id}/{source}/{report_key}/{granularity}/{period}.json.gz`
 — period partitioning here is what makes the retention purge a prefix
 list+delete instead of an age-based lifecycle rule (see retention/purge.py
 and the explicit anti-pattern in §15 against using object age for retention).
-
-The bucket MUST be created with the `eu` jurisdiction (action-plan.md §3),
-which means access goes through the dedicated endpoint
-`https://{account_id}.eu.r2.cloudflarestorage.com` rather than the default
-R2 S3-compatible endpoint — that endpoint is what `R2_ENDPOINT_URL` must
-point to in production, set at bucket-creation time and never changed.
 """
 
 from __future__ import annotations
 
 import gzip
 import json
-import os
 from dataclasses import dataclass
+from typing import Protocol
 
 
-def build_r2_key(
+def build_object_key(
     project_slug: str,
     source: str,
     report_key: str,
@@ -34,10 +38,10 @@ def build_r2_key(
     return f"{project_slug}/{source}/{report_key}/{granularity}/{period}.json.gz"
 
 
-def parse_r2_key(key: str) -> dict[str, str]:
+def parse_object_key(key: str) -> dict[str, str]:
     parts = key.split("/")
     if len(parts) != 5 or not parts[4].endswith(".json.gz"):
-        raise ValueError(f"Key does not match the expected R2 layout: {key!r}")
+        raise ValueError(f"Key does not match the expected object layout: {key!r}")
     project_slug, source, report_key, granularity, filename = parts
     period = filename.removesuffix(".json.gz")
     return {
@@ -52,7 +56,7 @@ def parse_r2_key(key: str) -> dict[str, str]:
 def period_year(period: str) -> int:
     """Extracts the data year from a period string, used by the retention
     purge to decide what to delete based on the PERIOD, never the object's
-    write timestamp (files are rewritten nightly, so object age carries no
+    write timestamp (objects are rewritten nightly, so age carries no
     signal about the data inside)."""
     return int(period.split("-")[0])
 
@@ -91,52 +95,15 @@ def serialize(document: Document) -> bytes:
     return gzip.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
 
 
-class R2Client:
-    """Thin wrapper over boto3's S3-compatible client. Writing is a full
-    object overwrite (never an append/patch), which is what makes the nightly
-    rolling re-extraction window (§7) naturally idempotent."""
+class StorageAdapter(Protocol):
+    """Every concrete backend implements exactly this surface. Writing is
+    always a full object overwrite (never an append/patch), which is what
+    makes the nightly rolling re-extraction window (§7) naturally
+    idempotent, and deletion is always by key list, never by an age-based
+    lifecycle rule (§15 anti-pattern)."""
 
-    def __init__(self, endpoint_url: str, bucket: str, access_key_id: str, secret_access_key: str) -> None:
-        import boto3  # deferred: keeps this module importable without boto3 installed, for tests
+    def put_document(self, key: str, document: Document) -> None: ...
 
-        self._bucket = bucket
-        self._client = boto3.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key,
-        )
+    def list_keys_with_prefix(self, prefix: str) -> list[str]: ...
 
-    @classmethod
-    def from_env(cls) -> "R2Client":
-        return cls(
-            endpoint_url=os.environ["R2_ENDPOINT_URL"],
-            bucket=os.environ["R2_BUCKET"],
-            access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-            secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-        )
-
-    def put_document(self, key: str, document: Document) -> None:
-        body = serialize(document)
-        self._client.put_object(
-            Bucket=self._bucket,
-            Key=key,
-            Body=body,
-            ContentType="application/json",
-            ContentEncoding="gzip",
-        )
-
-    def list_keys_with_prefix(self, prefix: str) -> list[str]:
-        keys: list[str] = []
-        paginator = self._client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
-            keys.extend(obj["Key"] for obj in page.get("Contents", []))
-        return keys
-
-    def delete_keys(self, keys: list[str]) -> None:
-        for i in range(0, len(keys), 1000):  # S3 delete_objects caps at 1000 per call
-            batch = keys[i : i + 1000]
-            self._client.delete_objects(
-                Bucket=self._bucket,
-                Delete={"Objects": [{"Key": k} for k in batch]},
-            )
+    def delete_keys(self, keys: list[str]) -> None: ...

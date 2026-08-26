@@ -10,9 +10,10 @@ interface ProjectSummary {
 }
 
 /** action-plan.md §10 / §14 Phase 6: "cross-account overview with KPIs for
- * every project." KPI values themselves come from each project's R2
- * documents via the Worker (same path as ReportPage) — this page lists the
- * projects the current user can see (RLS-scoped) and lets them drill in. */
+ * every project." KPI values themselves come from each project's GCS
+ * documents via the signing service (same path as ReportPage) — this page
+ * lists the projects the current user can see (RLS-scoped) and lets them
+ * drill in. */
 export function ProjectOverview(props: { onSelectProject: (projectId: string) => void }) {
   const locale = useUiLocale();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);

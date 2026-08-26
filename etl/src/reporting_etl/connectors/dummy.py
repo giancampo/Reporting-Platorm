@@ -1,7 +1,7 @@
 """Reference implementation of the Connector interface (action-plan.md §14:
 "the connector interface must be defined in Phase 1 and validated by writing
 a dummy adapter"). Generates deterministic synthetic rows so the rest of the
-pipeline — canonical transforms, R2 writer, frontend — can be exercised
+pipeline — canonical transforms, storage adapter, frontend — can be exercised
 end-to-end without any live source credentials."""
 
 from __future__ import annotations

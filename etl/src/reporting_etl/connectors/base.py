@@ -44,7 +44,7 @@ class QueryDef:
 class ExtractedRow:
     """One row of canonical data. `dimension_values` keys are canonical
     dimension names; `metric_values` keys are canonical metric names.
-    Everything downstream (bot filter, cardinality bucketing, R2 writer)
+    Everything downstream (bot filter, cardinality bucketing, storage adapter)
     operates only on this shape, never on a source-native one."""
 
     date_key: date

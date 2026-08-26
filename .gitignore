@@ -22,9 +22,6 @@ dist/
 .vite/
 coverage/
 
-# Wrangler
-.wrangler/
-
 # Supabase local
 supabase/.branches/
 supabase/.temp/

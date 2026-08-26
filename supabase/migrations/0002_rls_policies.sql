@@ -1,6 +1,7 @@
 -- Per-project isolation via RLS (action-plan.md §10). No frontend path is ever
--- allowed to bypass these policies; the Worker also validates the JWT before
--- proxying R2 reads, but that is a second, independent gate, not a substitute.
+-- allowed to bypass these policies; the Cloud Run signing service also
+-- validates the JWT and re-checks project access before issuing a signed
+-- URL, but that is a second, independent gate, not a substitute.
 
 alter table projects            enable row level security;
 alter table connections         enable row level security;

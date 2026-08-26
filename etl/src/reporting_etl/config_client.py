@@ -6,11 +6,14 @@ backend process, not a per-user session.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import httpx
+
+logger = logging.getLogger("reporting_etl.config_client")
 
 from .connectors.base import Connection, QueryDef
 
@@ -46,6 +49,19 @@ class ConfigClient:
             base_url=os.environ["SUPABASE_URL"],
             service_role_key=os.environ["SUPABASE_SERVICE_ROLE_KEY"],
         )
+
+    def ping(self) -> None:
+        """Keep-alive touch (action-plan.md §3): Supabase free projects
+        pause after 7 days of inactivity. Called unconditionally at the top
+        of every ETL run, independent of whatever `list_active_projects`
+        etc. do afterwards — deliberately never raises, since a ping
+        failure must never block the actual extraction it's meant to keep
+        alive for."""
+        try:
+            response = self._client.get("/projects", params={"select": "id", "limit": "1"})
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.exception("Supabase keep-alive ping failed; continuing with the ETL run anyway.")
 
     def list_active_projects(self) -> list[ProjectConfig]:
         response = self._client.get("/projects", params={"select": "*"})
