@@ -1,0 +1,31 @@
+/* PDF export, version 1 (action-plan.md §12): @media print CSS +
+ * window.print(), zero infrastructure. Respects whatever filters/comments
+ * are active at print time since it prints the live DOM, not a server
+ * render. */
+
+@media print {
+  nav,
+  [role="toolbar"],
+  button {
+    display: none !important;
+  }
+
+  section {
+    break-inside: avoid;
+    page-break-after: always;
+  }
+
+  section:last-child {
+    page-break-after: auto;
+  }
+
+  .report-page-footer {
+    display: block !important;
+    font-size: 0.75rem;
+    color: #555;
+  }
+}
+
+.report-page-footer {
+  display: none;
+}

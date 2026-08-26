@@ -1,0 +1,36 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.key.json
+service-account*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+build/
+
+# TypeScript
+*.tsbuildinfo
+
+# Node
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Wrangler
+.wrangler/
+
+# Supabase local
+supabase/.branches/
+supabase/.temp/
+
+# OS
+.DS_Store
+
+# Local tooling config
+.claude/

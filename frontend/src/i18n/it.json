@@ -1,0 +1,16 @@
+{
+  "nav.overview": "Panoramica",
+  "nav.reports": "Report",
+  "nav.admin": "Amministrazione",
+  "nav.dataPrivacy": "Dati e privacy",
+  "nav.logout": "Esci",
+  "projectSwitcher.label": "Progetto",
+  "freshness.lastUpdated": "Ultimo aggiornamento {date}",
+  "freshness.stale": "I dati potrebbero non essere aggiornati",
+  "comment.status.draft": "Bozza",
+  "comment.status.approved": "Approvato",
+  "comment.edit": "Modifica commento",
+  "login.title": "Accedi",
+  "login.email": "Email",
+  "login.submit": "Continua"
+}
